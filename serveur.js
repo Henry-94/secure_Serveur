@@ -1,43 +1,30 @@
 const express = require('express');
-const multer = require('multer');
 const http = require('http');
-const socketIo = require('socket.io');
+const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server);
-const port = 3000;
+const wss = new WebSocket.Server({ server });
 
-// Création du dossier pour les images si ce n'est pas déjà fait
-const uploadsDir = path.join(__dirname, 'Uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir);
-}
-
-// Configuration de multer pour la gestion des uploads d'images
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, `capture_${Date.now()}.jpg`);
-  }
-});
-const upload = multer({ storage: storage });
+let esp32Client = null;
+let androidClients = new Map();
 
 // Fichier pour stocker la configuration de l'appareil
 const configFilePath = path.join(__dirname, 'config.json');
 
 // Configuration par défaut
 let config = {
-  ssid: 'DEFAULT_SSID',
-  password: 'DEFAULT_PASS',
+  ssid: 'Mon_SSID_WiFi',
+  password: 'Mon_MotDePasse_WiFi',
   phoneNumber: '+261000000000',
   startHour: 18,
   endHour: 6
 };
+
+// Middleware pour gérer les requêtes POST avec données JSON
+app.use(express.json());
 
 // Charger la configuration depuis le fichier au démarrage
 if (fs.existsSync(configFilePath)) {
@@ -53,41 +40,13 @@ if (fs.existsSync(configFilePath)) {
   console.log('✅ Configuration par défaut créée :', config);
 }
 
-// Middleware pour parser les requêtes JSON
-app.use(express.json());
+// --- Endpoints pour la gestion de la configuration (utilisés par l'ESP32 et Android) ---
 
-// Servir les images statiquement (afin que les clients puissent les télécharger)
-app.use('/Uploads', express.static(uploadsDir));
-
-// --- Endpoints pour l'ESP32-CAM ---
-
-// Endpoint pour recevoir les images
-app.post('/upload', upload.single('image'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).send('Aucune image reçue');
-  }
-  const filePath = `/Uploads/${req.file.filename}`;
-  console.log('📸 Image reçue et enregistrée :', filePath);
-
-  // Notifier tous les clients Android connectés via Socket.IO
-  io.emit('new_image_available', { url: filePath, timestamp: Date.now() });
-
-  res.status(200).send('Image reçue et stockée avec succès');
-});
-
-// Endpoint pour envoyer la configuration à l'ESP32-CAM
-app.get('/get-config', (req, res) => {
-  res.json(config);
-  console.log('⚙️ Configuration demandée par ESP32, envoyée.');
-});
-
-// --- Endpoint pour l'application Android ---
-
-// Endpoint pour recevoir les configurations
+// Endpoint pour recevoir les configurations de l'application Android
 app.post('/set-config', (req, res) => {
   const { ssid, password, phoneNumber, startHour, endHour } = req.body;
 
-  // Mise à jour de la configuration avec les champs fournis
+  // Mise à jour uniquement des champs fournis
   if (ssid !== undefined) config.ssid = ssid;
   if (password !== undefined) config.password = password;
   if (phoneNumber !== undefined) config.phoneNumber = phoneNumber;
@@ -105,16 +64,113 @@ app.post('/set-config', (req, res) => {
   }
 });
 
-// Gestion des connexions Socket.IO
-io.on('connection', (socket) => {
-  console.log('📱 Client Android connecté via Socket.IO');
-  socket.on('disconnect', () => {
-    console.log('❌ Client Android déconnecté');
-  });
+// Endpoint pour que l'ESP32 récupère la dernière configuration
+app.get('/get-config', (req, res) => {
+  res.json(config);
+  console.log('⚙️ Configuration demandée par ESP32, envoyée.');
 });
 
-// Lancer le serveur
-server.listen(port, () => {
-  console.log(`🚀 Serveur en écoute sur http://localhost:${port}`);
-  console.log(`   (Accessible depuis l'ESP32-CAM à l'adresse http://192.168.1.100:${port})`);
+// --- Endpoints pour le transfert d'images ---
+
+// Route POST pour l'envoi d'images HTTP
+app.use(express.raw({
+    type: 'image/jpeg',
+    limit: '10mb'
+}));
+
+app.post('/upload', (req, res) => {
+    try {
+        if (!req.body || req.body.length === 0) {
+            return res.status(400).send('Aucun fichier reçu.');
+        }
+        const imageBuffer = req.body;
+        console.log(`✅ Image HTTP reçue (${imageBuffer.length} octets).`);
+
+        const base64Image = imageBuffer.toString('base64');
+        broadcastImageToAndroidClients(base64Image);
+
+        res.status(200).send('Image reçue et transmise aux clients WebSocket.');
+    } catch (error) {
+        console.error('❌ Erreur lors du traitement de l’image :', error);
+        res.status(500).send('Erreur interne du serveur.');
+    }
+});
+
+// --- Gestion des connexions WebSocket ---
+
+wss.on('connection', (ws) => {
+    console.log('🔗 Nouveau client WebSocket en attente d\'identification...');
+
+    ws.on('message', (message) => {
+        let data;
+        try {
+            data = JSON.parse(message);
+        } catch (err) {
+            console.error('❌ Erreur de parsing JSON:', err.message);
+            ws.close(1002, "Message non valide");
+            return;
+        }
+
+        if (data.type === 'esp32') {
+            if (esp32Client) {
+                esp32Client.close(1000, "Nouvelle connexion ESP32");
+            }
+            esp32Client = ws;
+            console.log('🔗 ESP32 connecté.');
+        } else if (data.type === 'android') {
+            const clientId = Date.now();
+            androidClients.set(clientId, ws);
+            console.log('🔗 Client Android identifié. Total:', androidClients.size);
+        } else {
+            ws.send(JSON.stringify({ type: 'error', message: 'Type de client inconnu.' }));
+        }
+    });
+
+    ws.on('close', (code, reason) => {
+        if (ws === esp32Client) {
+            esp32Client = null;
+            console.log(`❌ ESP32 déconnecté. Code: ${code}, Raison: ${reason}`);
+        } else {
+            let clientFound = false;
+            androidClients.forEach((client, key) => {
+                if (client === ws) {
+                    androidClients.delete(key);
+                    clientFound = true;
+                }
+            });
+            if (clientFound) {
+                console.log(`❌ Client Android déconnecté. Total: ${androidClients.size}`);
+            }
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error('❌ Erreur WebSocket:', error.message);
+    });
+});
+
+// Fonctions utilitaires pour la diffusion
+function broadcastImageToAndroidClients(base64Data) {
+    if (androidClients.size === 0) {
+        console.log("⚠️ Aucun client Android n'est connecté pour recevoir l'image.");
+        return;
+    }
+    const message = JSON.stringify({
+        type: "image",
+        data: base64Data
+    });
+    androidClients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            try {
+                client.send(message);
+            } catch (err) {
+                console.error('❌ Erreur lors de l\'envoi de l\'image à un client Android:', err.message);
+            }
+        }
+    });
+}
+
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+    console.log(`🚀 Serveur WebSocket démarré sur le port ${PORT}`);
 });
