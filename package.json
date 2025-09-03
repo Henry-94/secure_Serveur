@@ -20,11 +20,14 @@
 
   "description": "",
 
- "dependencies": {
-"express": "^5.1.0",
-"express-ws": "^5.0.2",
-"multer": "^2.0.2",
-"ws": "^8.18.0"
-}
+  "dependencies": {
+
+    "express": "^5.1.0",
+
+    "multer": "^2.0.2",
+
+    "socket.io": "^4.8.1"
+
+  }
 
 }
